@@ -1416,33 +1416,76 @@ static bool is_route_string_kind(const char *kind) {
            strcmp(kind, "interpreted_string_literal") == 0;
 }
 
-static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+/* Longest relative route segment accepted from a verb decorator argument. */
+enum { NEST_MAX_ROUTE_SEG = 128 };
+
+/* TS/JS decorator-routed frameworks (NestJS) write class-relative paths with no
+ * leading slash: @Get(':id'), @Patch('availability'). */
+static bool is_ts_like_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT;
+}
+
+/* A relative segment is only path-shaped when it carries no whitespace and no
+ * expression/markup punctuation. Verb decorators are the only callers, but this
+ * still keeps non-route literals from minting Route nodes (#598, #1248). */
+static bool is_relative_route_path(const char *s) {
+    if (!s || !s[0]) {
+        return false;
+    }
+    size_t len = strlen(s);
+    if (len >= (size_t)NEST_MAX_ROUTE_SEG) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= ' ' || c == '{' || c == '}' || c == '(' || c == ')' || c == '<' || c == '>' ||
+            c == '?' || c == '#' || c == '\\' || c == '`') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Strip one matching pair of surrounding quotes, if present. */
+static char *strip_route_quotes(CBMArena *a, char *text) {
+    if (!text) {
+        return NULL;
+    }
+    int tlen = (int)strlen(text);
+    if (tlen >= PAIR_CHARS && (text[0] == '"' || text[0] == '\'' || text[0] == '`')) {
+        return cbm_arena_strndup(a, text + SKIP_CHAR, (size_t)(tlen - PAIR_CHARS));
+    }
+    return text;
+}
+
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source,
+                                               bool allow_relative) {
     if (!is_route_string_kind(ts_node_type(node))) {
         return NULL;
     }
-    char *path = cbm_node_text(a, node, source);
+    char *path = strip_route_quotes(a, cbm_node_text(a, node, source));
     if (!path) {
         return NULL;
     }
-    int plen = (int)strlen(path);
-    if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
-        path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
+    if (path[0] == '/') {
+        return path;
     }
-    return (path && path[0] == '/') ? path : NULL;
+    return (allow_relative && is_relative_route_path(path)) ? path : NULL;
 }
 
 static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
-                                           int max_depth) {
+                                           int max_depth, bool allow_relative) {
     if (ts_node_is_null(node) || max_depth < 0) {
         return NULL;
     }
-    const char *path = route_path_from_string_node(a, node, source);
+    const char *path = route_path_from_string_node(a, node, source, allow_relative);
     if (path || max_depth == 0) {
         return path;
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
-        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1,
+                                       allow_relative);
         if (path) {
             return path;
         }
@@ -1450,8 +1493,10 @@ static const char *find_route_path_literal(CBMArena *a, TSNode node, const char 
     return NULL;
 }
 
-// Extract route path from decorator arguments (first string that starts with /).
-static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
+// Extract route path from decorator arguments (first string that starts with /,
+// or — for TS/JS verb decorators — the first path-shaped relative segment).
+static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source,
+                                                bool allow_relative) {
     /* Every argument is checked. Java and Kotlin put no order on annotation
      * attributes, so `path` can sit anywhere in the list. Stopping early left
      * a real route unread and formed no Route node. Each argument's own
@@ -1464,7 +1509,8 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
          *   @GetMapping(path = {"/orders"})
          * Walk a bounded subtree and keep the first string literal that is
          * path-shaped, while ignoring non-route literals such as media types. */
-        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
+        const char *path =
+            find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH, allow_relative);
         if (path) {
             return path;
         }
@@ -1593,7 +1639,8 @@ static bool try_drf_action_decorator(CBMArena *a, TSNode dchild, const char *sou
 // Try to extract a route from a single decorator call node.
 // Returns true if a route method was found (even with fallback path "/").
 static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char *source,
-                                          const char **out_path, const char **out_method) {
+                                          const char **out_path, const char **out_method,
+                                          bool allow_relative) {
     TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
     if (ts_node_is_null(fn)) {
         fn = ts_node_named_child(dchild, 0);
@@ -1610,7 +1657,7 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
-        const char *path = extract_route_path_from_args(a, args, source);
+        const char *path = extract_route_path_from_args(a, args, source, allow_relative);
         if (path) {
             *out_path = path;
             *out_method = method;
@@ -1690,7 +1737,7 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
-        path = extract_route_path_from_args(a, args, source);
+        path = extract_route_path_from_args(a, args, source, false);
     }
     *out_path = path ? path : "/";
     *out_method = method;
@@ -1740,7 +1787,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
             if (!*out_jax_path && strcmp(name, "Path") == 0) {
                 TSNode args = annotation_args_node(child);
                 if (!ts_node_is_null(args)) {
-                    *out_jax_path = extract_route_path_from_args(a, args, source);
+                    *out_jax_path = extract_route_path_from_args(a, args, source, false);
                 }
                 continue;
             }
@@ -1750,7 +1797,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
                     *out_method = method;
                     TSNode args = annotation_args_node(child);
                     if (!ts_node_is_null(args)) {
-                        *out_map_path = extract_route_path_from_args(a, args, source);
+                        *out_map_path = extract_route_path_from_args(a, args, source, false);
                     }
                 }
             }
@@ -1785,19 +1832,30 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
         return;
     }
 
+    const bool allow_relative = is_ts_like_lang(spec->language);
     TSNode prev = ts_node_prev_sibling(func_node);
     while (!ts_node_is_null(prev)) {
         if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
-            break;
+            /* Anonymous tokens and comments interleaved in a decorator run must
+             * not end the scan (mirrors extract_decorators; see #1095). */
+            if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
+                break;
+            }
+            prev = ts_node_prev_sibling(prev);
+            continue;
         }
 
         uint32_t dc = ts_node_named_child_count(prev);
         for (uint32_t di = 0; di < dc; di++) {
             TSNode dchild = ts_node_named_child(prev, di);
-            if (strcmp(ts_node_type(dchild), "call") != 0) {
+            /* Python emits `call`; TS/JS emit `call_expression`. Matching only
+             * the Python spelling left every TS decorator route unextracted. */
+            const char *dkind = ts_node_type(dchild);
+            if (strcmp(dkind, "call") != 0 && strcmp(dkind, "call_expression") != 0) {
                 continue;
             }
-            if (try_route_from_decorator_call(a, dchild, source, out_path, out_method)) {
+            if (try_route_from_decorator_call(a, dchild, source, out_path, out_method,
+                                              allow_relative)) {
                 return;
             }
             if (try_drf_action_decorator(a, dchild, source, func_node, out_path, out_method)) {
@@ -1853,6 +1911,114 @@ static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, con
     }
     if (method) {
         return "/"; /* mapping annotation without a path argument */
+    }
+    return NULL;
+}
+
+/* NestJS: pull a named string property out of an object-literal decorator
+ * argument — @Controller({ path: 'agents', version: '1' }). Only string values
+ * are accepted, so a symbolic version (VERSION_NEUTRAL) yields no segment,
+ * which is what NestJS itself does. */
+static const char *nest_object_string_prop(CBMArena *a, TSNode node, const char *source,
+                                           const char *key_name, int max_depth) {
+    if (ts_node_is_null(node) || max_depth < 0) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(node), "pair") == 0) {
+        TSNode k = ts_node_child_by_field_name(node, TS_FIELD("key"));
+        TSNode v = ts_node_child_by_field_name(node, TS_FIELD("value"));
+        if (!ts_node_is_null(k) && !ts_node_is_null(v)) {
+            const char *key = strip_route_quotes(a, cbm_node_text(a, k, source));
+            if (key && strcmp(key, key_name) == 0) {
+                if (!is_route_string_kind(ts_node_type(v))) {
+                    return NULL;
+                }
+                const char *val = strip_route_quotes(a, cbm_node_text(a, v, source));
+                return (val && val[0]) ? val : NULL;
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *found =
+            nest_object_string_prop(a, ts_node_named_child(node, i), source, key_name, max_depth - 1);
+        if (found) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/* Build the class-level route prefix from a NestJS @Controller decorator.
+ * Handles both @Controller('admin/analytics') and the options form
+ * @Controller({ path: 'agents', version: '1' }) -> "/v1/agents".
+ * Returns NULL when the class carries no @Controller. */
+static const char *nest_controller_prefix_from_args(CBMArena *a, TSNode call_node,
+                                                    const char *source) {
+    TSNode args = find_decorator_args(call_node);
+    if (ts_node_is_null(args)) {
+        return "/";
+    }
+    const char *path = nest_object_string_prop(a, args, source, "path", CBM_DESCENDANT_MAX_DEPTH);
+    const char *version =
+        nest_object_string_prop(a, args, source, "version", CBM_DESCENDANT_MAX_DEPTH);
+    if (!path && !version) {
+        /* Plain string form: @Controller('admin/analytics') */
+        path = find_route_path_literal(a, args, source, CBM_DESCENDANT_MAX_DEPTH, true);
+    }
+    if (version && path) {
+        return cbm_arena_sprintf(a, "/v%s/%s", version, path[0] == '/' ? path + SKIP_CHAR : path);
+    }
+    if (version) {
+        return cbm_arena_sprintf(a, "/v%s", version);
+    }
+    if (path) {
+        return path[0] == '/' ? path : cbm_arena_sprintf(a, "/%s", path);
+    }
+    return "/";
+}
+
+static const char *nest_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
+                                           const CBMLangSpec *spec) {
+    if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
+        return NULL;
+    }
+    TSNode prev = ts_node_prev_sibling(class_node);
+    while (!ts_node_is_null(prev)) {
+        if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
+            /* `export` between the decorator and the class is an anonymous
+             * token; comments may also sit in the run (#1095). */
+            if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
+                break;
+            }
+            prev = ts_node_prev_sibling(prev);
+            continue;
+        }
+        uint32_t dc = ts_node_named_child_count(prev);
+        for (uint32_t di = 0; di < dc; di++) {
+            TSNode dchild = ts_node_named_child(prev, di);
+            const char *dkind = ts_node_type(dchild);
+            if (strcmp(dkind, "call") != 0 && strcmp(dkind, "call_expression") != 0) {
+                continue;
+            }
+            TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
+            if (ts_node_is_null(fn)) {
+                fn = ts_node_named_child(dchild, 0);
+            }
+            if (ts_node_is_null(fn)) {
+                continue;
+            }
+            char *fn_text = cbm_node_text(a, fn, source);
+            if (!fn_text) {
+                continue;
+            }
+            const char *dot = strrchr(fn_text, '.');
+            const char *base = dot ? dot + SKIP_CHAR : fn_text;
+            if (strcmp(base, "Controller") == 0) {
+                return nest_controller_prefix_from_args(a, dchild, source);
+            }
+        }
+        prev = ts_node_prev_sibling(prev);
     }
     return NULL;
 }
@@ -4997,6 +5163,18 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
+    } else if (def.route_path && is_ts_like_lang(ctx->language)) {
+        /* NestJS composes @Controller(prefix) with the method's relative path.
+         * A handler whose class carries no @Controller is not a server route. */
+        const char *prefix = nest_class_route_prefix(a, class_node, ctx->source, spec);
+        if (!prefix) {
+            def.route_path = NULL;
+            def.route_method = NULL;
+        } else {
+            const char *joined = join_route_paths(a, prefix, def.route_path);
+            def.route_path =
+                (joined && joined[0] == '/') ? joined : cbm_arena_sprintf(a, "/%s", joined);
+        }
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
