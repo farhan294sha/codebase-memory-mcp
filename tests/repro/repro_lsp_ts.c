@@ -347,7 +347,28 @@ static const char kTsUnresolved[] =
     "function known(x: number): number { return x + 1; }\n"
     "function caller(v: number): number { return known(v) + totallyUnknownFn(v); }\n";
 
+/* Constructor-injected dependency across files — the NestJS service shape.
+ * The only call is through a `private readonly` constructor parameter property,
+ * so lsp_ts_method is present only if the parameter registers as a field. */
+static const RFile kTsParamPropertyInjection[] = {
+    {"repo.ts", "export class Repo {\n"
+                "    findById(id: string): string { return id; }\n"
+                "}\n"},
+    {"service.ts", "import { Repo } from \"./repo\";\n"
+                   "export class Service {\n"
+                   "    constructor(private readonly repo: Repo) {}\n"
+                   "    load(id: string): string { return this.repo.findById(id); }\n"
+                   "}\n"},
+};
+
 /* ── Per-strategy tests ──────────────────────────────────────────────────── */
+
+TEST(repro_lsp_ts_param_property_injection) {
+    return assert_lsp_strategy_files(
+        kTsParamPropertyInjection,
+        (int)(sizeof(kTsParamPropertyInjection) / sizeof(kTsParamPropertyInjection[0])),
+        "lsp_ts_method");
+}
 
 TEST(repro_lsp_ts_local) {
     return assert_lsp_strategy("main.ts", kTsLocal, "lsp_ts_local");
@@ -407,4 +428,5 @@ SUITE(repro_lsp_ts) {
     RUN_TEST(repro_lsp_ts_jsx_import);
     RUN_TEST(repro_lsp_ts_default);
     RUN_TEST(repro_lsp_ts_unresolved);
+    RUN_TEST(repro_lsp_ts_param_property_injection);
 }
