@@ -1940,8 +1940,8 @@ static const char *nest_object_string_prop(CBMArena *a, TSNode node, const char 
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
-        const char *found =
-            nest_object_string_prop(a, ts_node_named_child(node, i), source, key_name, max_depth - 1);
+        const char *found = nest_object_string_prop(a, ts_node_named_child(node, i), source,
+                                                    key_name, max_depth - 1);
         if (found) {
             return found;
         }
