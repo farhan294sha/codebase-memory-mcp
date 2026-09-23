@@ -1904,7 +1904,55 @@ TEST(tslsp_class_constructor_param_property) {
                                   "}\n"
                                   "function go(b: Box) { b.tool.fire(); }\n");
     ASSERT_NOT_NULL(r);
-    /* Constructor parameter property — accept smoke pass for v1 */
+    ASSERT_GTE(require_resolved(r, ".go", "fire"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_class_constructor_param_property_this_dispatch) {
+    /* The NestJS injection shape: `private readonly` param, called via `this.`. */
+    CBMFileResult *r =
+        extract_ts("class Repo { findById(id: string): string { return id; } }\n"
+                   "class Service {\n"
+                   "    constructor(private readonly repo: Repo) {}\n"
+                   "    load(id: string): string { return this.repo.findById(id); }\n"
+                   "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".load", "findById"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_class_constructor_param_property_modifiers) {
+    /* Each modifier alone declares a field; `readonly` needs no access keyword. */
+    CBMFileResult *r =
+        extract_ts("class Tool { fire(): void {} }\n"
+                   "class Box {\n"
+                   "    constructor(readonly a: Tool, protected b: Tool, private c?: Tool) {}\n"
+                   "    go(): void { this.a.fire(); this.b.fire(); this.c!.fire(); }\n"
+                   "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".go", "fire"), 0);
+    int fires = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->confidence > 0 && rc->callee_qn && strstr(rc->callee_qn, "Tool.fire"))
+            fires++;
+    }
+    ASSERT_GTE(fires, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_class_constructor_plain_param_is_not_field) {
+    /* Without a modifier the parameter is local to the constructor: no field. */
+    CBMFileResult *r = extract_ts("class Tool { fire(): void {} }\n"
+                                  "class Box {\n"
+                                  "    constructor(tool: Tool) { tool.fire(); }\n"
+                                  "    go(): void { this.tool.fire(); }\n"
+                                  "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, ".go", "Tool.fire"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -4462,6 +4510,9 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_class_implements_interface);
     RUN_TEST(tslsp_class_multi_inheritance_chain);
     RUN_TEST(tslsp_class_constructor_param_property);
+    RUN_TEST(tslsp_class_constructor_param_property_this_dispatch);
+    RUN_TEST(tslsp_class_constructor_param_property_modifiers);
+    RUN_TEST(tslsp_class_constructor_plain_param_is_not_field);
 
     /* Iteration */
     RUN_TEST(tslsp_for_of_array_method);
